@@ -126,6 +126,8 @@ func (q *Query) stores(w http.ResponseWriter, r *http.Request) {
 		statuses[status.StoreType] = append(statuses[status.StoreType], status)
 	}
 
+	// TODO(bwplotka): Somehow remove  store.CompatibilityTypeLabelName as it is our internal label.
+
 	sources := make([]component.StoreAPI, 0, len(statuses))
 	for k := range statuses {
 		sources = append(sources, k)

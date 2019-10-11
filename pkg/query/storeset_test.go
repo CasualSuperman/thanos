@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thanos-io/thanos/pkg/store"
+
 	"sort"
 
 	"github.com/fortytw2/leaktest"
@@ -26,11 +28,6 @@ var testGRPCOpts = []grpc.DialOption{
 	grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(math.MaxInt32)),
 	grpc.WithInsecure(),
 }
-
-var (
-	emptyStoresExtLabels [][]storepb.Label
-	emptyStoresTypes     []component.StoreAPI
-)
 
 type testStore struct {
 	info storepb.InfoResponse
@@ -56,69 +53,38 @@ func (s *testStore) LabelValues(ctx context.Context, r *storepb.LabelValuesReque
 	return nil, status.Error(codes.Unimplemented, "not implemented")
 }
 
+type testStoreMeta struct {
+	extlsetFn func(addr string) []storepb.LabelSet
+	storeType component.StoreAPI
+}
+
 type testStores struct {
 	srvs map[string]*grpc.Server
 }
 
-func newTestStores(numStores int, storesExtLabels [][]storepb.Label, storesTypes []component.StoreAPI) (*testStores, error) {
+func startTestStores(stores []testStoreMeta) (*testStores, error) {
 	st := &testStores{
 		srvs: map[string]*grpc.Server{},
 	}
 
-	for i := 0; i < numStores; i++ {
-		lsetFn := func(addr string) []storepb.LabelSet {
-			if len(storesExtLabels) != numStores {
-				return []storepb.LabelSet{{
-					Labels: []storepb.Label{
-						{
-							Name:  "addr",
-							Value: addr,
-						},
-					},
-				}}
-			}
-			ls := storesExtLabels[i]
-			if len(ls) == 0 {
-				return []storepb.LabelSet{}
-			}
-
-			return []storepb.LabelSet{{Labels: storesExtLabels[i]}}
-		}
-
-		storeTypeFn := func() storepb.StoreType {
-			if len(storesTypes) != numStores {
-				return component.Sidecar.ToProto()
-			}
-			st := storesTypes[i]
-			return st.ToProto()
-		}
-
-		srv, addr, err := startStore(lsetFn, storeTypeFn)
+	for _, store := range stores {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			// Close so far started servers.
 			st.Close()
 			return nil, err
 		}
 
-		st.srvs[addr] = srv
+		srv := grpc.NewServer()
+		storepb.RegisterStoreServer(srv, &testStore{info: storepb.InfoResponse{LabelSets: store.extlsetFn(listener.Addr().String()), StoreType: store.storeType.ToProto()}})
+		go func() {
+			_ = srv.Serve(listener)
+		}()
+
+		st.srvs[listener.Addr().String()] = srv
 	}
 
 	return st, nil
-}
-
-func startStore(lsetFn func(addr string) []storepb.LabelSet, storeTypeFn func() storepb.StoreType) (*grpc.Server, string, error) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return nil, "", err
-	}
-
-	srv := grpc.NewServer()
-	storepb.RegisterStoreServer(srv, &testStore{info: storepb.InfoResponse{LabelSets: lsetFn(listener.Addr().String()), StoreType: storeTypeFn()}})
-	go func() {
-		_ = srv.Serve(listener)
-	}()
-
-	return srv, listener.Addr().String(), nil
 }
 
 func (s *testStores) StoreAddresses() []string {
@@ -158,7 +124,38 @@ func specsFromAddrFunc(addrs []string) func() []StoreSpec {
 func TestStoreSet_AllAvailable_ThenDown(t *testing.T) {
 	defer leaktest.CheckTimeout(t, 10*time.Second)()
 
-	st, err := newTestStores(2, emptyStoresExtLabels, emptyStoresTypes)
+	st, err := startTestStores([]testStoreMeta{
+		{
+			extlsetFn: func(addr string) []storepb.LabelSet {
+				return []storepb.LabelSet{
+					{
+						Labels: []storepb.Label{
+							{
+								Name:  "addr",
+								Value: addr,
+							},
+						},
+					},
+				}
+			},
+			storeType: component.Sidecar,
+		},
+		{
+			extlsetFn: func(addr string) []storepb.LabelSet {
+				return []storepb.LabelSet{
+					{
+						Labels: []storepb.Label{
+							{
+								Name:  "addr",
+								Value: addr,
+							},
+						},
+					},
+				}
+			},
+			storeType: component.Sidecar,
+		},
+	})
 	testutil.Ok(t, err)
 	defer st.Close()
 
@@ -202,7 +199,38 @@ func TestStoreSet_AllAvailable_ThenDown(t *testing.T) {
 func TestStoreSet_StaticStores_OneAvailable(t *testing.T) {
 	defer leaktest.CheckTimeout(t, 10*time.Second)()
 
-	st, err := newTestStores(2, emptyStoresExtLabels, emptyStoresTypes)
+	st, err := startTestStores([]testStoreMeta{
+		{
+			extlsetFn: func(addr string) []storepb.LabelSet {
+				return []storepb.LabelSet{
+					{
+						Labels: []storepb.Label{
+							{
+								Name:  "addr",
+								Value: addr,
+							},
+						},
+					},
+				}
+			},
+			storeType: component.Sidecar,
+		},
+		{
+			extlsetFn: func(addr string) []storepb.LabelSet {
+				return []storepb.LabelSet{
+					{
+						Labels: []storepb.Label{
+							{
+								Name:  "addr",
+								Value: addr,
+							},
+						},
+					},
+				}
+			},
+			storeType: component.Sidecar,
+		},
+	})
 	testutil.Ok(t, err)
 	defer st.Close()
 
@@ -231,7 +259,38 @@ func TestStoreSet_StaticStores_OneAvailable(t *testing.T) {
 func TestStoreSet_StaticStores_NoneAvailable(t *testing.T) {
 	defer leaktest.CheckTimeout(t, 10*time.Second)()
 
-	st, err := newTestStores(2, emptyStoresExtLabels, emptyStoresTypes)
+	st, err := startTestStores([]testStoreMeta{
+		{
+			extlsetFn: func(addr string) []storepb.LabelSet {
+				return []storepb.LabelSet{
+					{
+						Labels: []storepb.Label{
+							{
+								Name:  "addr",
+								Value: addr,
+							},
+						},
+					},
+				}
+			},
+			storeType: component.Sidecar,
+		},
+		{
+			extlsetFn: func(addr string) []storepb.LabelSet {
+				return []storepb.LabelSet{
+					{
+						Labels: []storepb.Label{
+							{
+								Name:  "addr",
+								Value: addr,
+							},
+						},
+					},
+				}
+			},
+			storeType: component.Sidecar,
+		},
+	})
 	testutil.Ok(t, err)
 	defer st.Close()
 
@@ -251,42 +310,198 @@ func TestStoreSet_StaticStores_NoneAvailable(t *testing.T) {
 
 }
 
+// TODO(bwplotka): Bring back duplicate check https://github.com/thanos-io/thanos/issues/1635
+// For now allow all.
 func TestStoreSet_AllAvailable_BlockExtLsetDuplicates(t *testing.T) {
 	defer leaktest.CheckTimeout(t, 10*time.Second)()
 
-	storeExtLabels := [][]storepb.Label{
+	st, err := startTestStores([]testStoreMeta{
 		{
-			{Name: "l1", Value: "v1"},
+			storeType: component.Query,
+			extlsetFn: func(addr string) []storepb.LabelSet {
+				return []storepb.LabelSet{
+					{
+						Labels: []storepb.Label{
+							{Name: "l1", Value: "v2"},
+							{Name: "l2", Value: "v3"},
+						},
+					},
+					{
+						Labels: []storepb.Label{
+							{Name: "l3", Value: "v4"},
+						},
+					},
+				}
+			},
 		},
 		{
-			{Name: "l1", Value: "v2"},
-			{Name: "l2", Value: "v3"},
+			// Duplicated Querier.
+			storeType: component.Query,
+			extlsetFn: func(addr string) []storepb.LabelSet {
+				return []storepb.LabelSet{
+					{
+						Labels: []storepb.Label{
+							{Name: "l1", Value: "v2"},
+							{Name: "l2", Value: "v3"},
+						},
+					},
+					{
+						Labels: []storepb.Label{
+							{Name: "l3", Value: "v4"},
+						},
+					},
+				}
+			},
 		},
 		{
-			// Duplicate with above.
-			{Name: "l1", Value: "v2"},
-			{Name: "l2", Value: "v3"},
+			storeType: component.Sidecar,
+			extlsetFn: func(addr string) []storepb.LabelSet {
+				return []storepb.LabelSet{
+					{
+						Labels: []storepb.Label{
+							{Name: "l1", Value: "v2"},
+							{Name: "l2", Value: "v3"},
+						},
+					},
+				}
+			},
 		},
-		// Two store nodes, they don't have ext labels set.
-		nil,
-		nil,
 		{
-			// Duplicate with two others.
-			{Name: "l1", Value: "v2"},
-			{Name: "l2", Value: "v3"},
+			// Duplicated Sidecar.
+			storeType: component.Sidecar,
+			extlsetFn: func(addr string) []storepb.LabelSet {
+				return []storepb.LabelSet{
+					{
+						Labels: []storepb.Label{
+							{Name: "l1", Value: "v2"},
+							{Name: "l2", Value: "v3"},
+						},
+					},
+				}
+			},
 		},
-	}
-
-	storeTypes := []component.StoreAPI{
-		component.Query,
-		component.Sidecar,
-		component.Query,
-		component.Store,
-		component.Store,
-		component.Sidecar,
-	}
-
-	st, err := newTestStores(6, storeExtLabels, storeTypes)
+		{
+			// Querier that duplicates with sidecar.
+			storeType: component.Query,
+			extlsetFn: func(addr string) []storepb.LabelSet {
+				return []storepb.LabelSet{
+					{
+						Labels: []storepb.Label{
+							{Name: "l1", Value: "v2"},
+							{Name: "l2", Value: "v3"},
+						},
+					},
+				}
+			},
+		},
+		{
+			storeType: component.Rule,
+			extlsetFn: func(addr string) []storepb.LabelSet {
+				return []storepb.LabelSet{
+					{
+						Labels: []storepb.Label{
+							{Name: "l1", Value: "v2"},
+							{Name: "l2", Value: "v3"},
+						},
+					},
+				}
+			},
+		},
+		{
+			// Duplicated Rule.
+			storeType: component.Rule,
+			extlsetFn: func(addr string) []storepb.LabelSet {
+				return []storepb.LabelSet{
+					{
+						Labels: []storepb.Label{
+							{Name: "l1", Value: "v2"},
+							{Name: "l2", Value: "v3"},
+						},
+					},
+				}
+			},
+		},
+		// Two pre v0.8.0 store gateway nodes, they don't have ext labels set.
+		{
+			storeType: component.Store,
+			extlsetFn: func(addr string) []storepb.LabelSet {
+				return []storepb.LabelSet{}
+			},
+		},
+		{
+			storeType: component.Store,
+			extlsetFn: func(addr string) []storepb.LabelSet {
+				return []storepb.LabelSet{}
+			},
+		},
+		// Regression tests against https://github.com/thanos-io/thanos/issues/1632: From v0.8.0 stores advertise labels.
+		// If the object storage handled by store gateway has only one sidecar we were hitting issue.
+		{
+			storeType: component.Store,
+			extlsetFn: func(addr string) []storepb.LabelSet {
+				return []storepb.LabelSet{
+					{
+						Labels: []storepb.Label{
+							{Name: "l1", Value: "v2"},
+							{Name: "l2", Value: "v3"},
+						},
+					},
+					{
+						Labels: []storepb.Label{
+							{Name: "l3", Value: "v4"},
+						},
+					},
+				}
+			},
+		},
+		// Stores v0.8.1 has compatibility labels. Check if they are correctly removed.
+		{
+			storeType: component.Store,
+			extlsetFn: func(addr string) []storepb.LabelSet {
+				return []storepb.LabelSet{
+					{
+						Labels: []storepb.Label{
+							{Name: "l1", Value: "v2"},
+							{Name: "l2", Value: "v3"},
+						},
+					},
+					{
+						Labels: []storepb.Label{
+							{Name: "l3", Value: "v4"},
+						},
+					},
+					{
+						Labels: []storepb.Label{
+							{Name: store.CompatibilityTypeLabelName, Value: "store"},
+						},
+					},
+				}
+			},
+		},
+		{
+			storeType: component.Store,
+			extlsetFn: func(addr string) []storepb.LabelSet {
+				return []storepb.LabelSet{
+					{
+						Labels: []storepb.Label{
+							{Name: "l1", Value: "v2"},
+							{Name: "l2", Value: "v3"},
+						},
+					},
+					{
+						Labels: []storepb.Label{
+							{Name: "l3", Value: "v4"},
+						},
+					},
+					{
+						Labels: []storepb.Label{
+							{Name: store.CompatibilityTypeLabelName, Value: "store"},
+						},
+					},
+				}
+			},
+		},
+	})
 	testutil.Ok(t, err)
 	defer st.Close()
 
@@ -303,26 +518,98 @@ func TestStoreSet_AllAvailable_BlockExtLsetDuplicates(t *testing.T) {
 	storeSet.Update(context.Background())
 	storeSet.Update(context.Background())
 
-	testutil.Assert(t, len(storeSet.stores) == 4, fmt.Sprintf("all services should respond just fine, but we expect duplicates being blocked. Expected %d stores, got %d", 4, len(storeSet.stores)))
+	testutil.Assert(t, len(storeSet.stores) == 12, fmt.Sprintf("all services should respond just fine, but we expect duplicates being blocked. Expected %d stores, got %d", 12, len(storeSet.stores)))
 
 	// Sort result to be able to compare.
-	var existingStoreLabels [][]storepb.Label
+	var existingStoreLabels [][][]storepb.Label
 	for _, store := range storeSet.stores {
+		lset := [][]storepb.Label{}
 		for _, ls := range store.LabelSets() {
-			existingStoreLabels = append(existingStoreLabels, ls.Labels)
+			lset = append(lset, ls.Labels)
 		}
+		existingStoreLabels = append(existingStoreLabels, lset)
 	}
 	sort.Slice(existingStoreLabels, func(i, j int) bool {
 		return len(existingStoreLabels[i]) > len(existingStoreLabels[j])
 	})
 
-	testutil.Equals(t, [][]storepb.Label{
+	testutil.Equals(t, [][][]storepb.Label{
 		{
-			{Name: "l1", Value: "v2"},
-			{Name: "l2", Value: "v3"},
+			{
+				{Name: "l1", Value: "v2"},
+				{Name: "l2", Value: "v3"},
+			},
+			{
+				{Name: "l3", Value: "v4"},
+			},
 		},
 		{
-			{Name: "l1", Value: "v1"},
+			{
+				{Name: "l1", Value: "v2"},
+				{Name: "l2", Value: "v3"},
+			},
+			{
+				{Name: "l3", Value: "v4"},
+			},
+		},
+		{
+			{
+				{Name: "l1", Value: "v2"},
+				{Name: "l2", Value: "v3"},
+			},
+		},
+		{
+			{
+				{Name: "l1", Value: "v2"},
+				{Name: "l2", Value: "v3"},
+			},
+		},
+		{
+			{
+				{Name: "l1", Value: "v2"},
+				{Name: "l2", Value: "v3"},
+			},
+		},
+		{
+			{
+				{Name: "l1", Value: "v2"},
+				{Name: "l2", Value: "v3"},
+			},
+		},
+		{
+			{
+				{Name: "l1", Value: "v2"},
+				{Name: "l2", Value: "v3"},
+			},
+		},
+		{},
+		{},
+		{
+			{
+				{Name: "l1", Value: "v2"},
+				{Name: "l2", Value: "v3"},
+			},
+			{
+				{Name: "l3", Value: "v4"},
+			},
+		},
+		{
+			{
+				{Name: "l1", Value: "v2"},
+				{Name: "l2", Value: "v3"},
+			},
+			{
+				{Name: "l3", Value: "v4"},
+			},
+		},
+		{
+			{
+				{Name: "l1", Value: "v2"},
+				{Name: "l2", Value: "v3"},
+			},
+			{
+				{Name: "l3", Value: "v4"},
+			},
 		},
 	}, existingStoreLabels)
 }

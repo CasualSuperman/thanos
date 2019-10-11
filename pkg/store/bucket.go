@@ -46,15 +46,20 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// maxSamplesPerChunk is approximately the max number of samples that we may have in any given chunk. This is needed
-// for precalculating the number of samples that we may have to retrieve and decode for any given query
-// without downloading them. Please take a look at https://github.com/prometheus/tsdb/pull/397 to know
-// where this number comes from. Long story short: TSDB is made in such a way, and it is made in such a way
-// because you barely get any improvements in compression when the number of samples is beyond this.
-// Take a look at Figure 6 in this whitepaper http://www.vldb.org/pvldb/vol8/p1816-teller.pdf.
-const maxSamplesPerChunk = 120
+const (
+	// maxSamplesPerChunk is approximately the max number of samples that we may have in any given chunk. This is needed
+	// for precalculating the number of samples that we may have to retrieve and decode for any given query
+	// without downloading them. Please take a look at https://github.com/prometheus/tsdb/pull/397 to know
+	// where this number comes from. Long story short: TSDB is made in such a way, and it is made in such a way
+	// because you barely get any improvements in compression when the number of samples is beyond this.
+	// Take a look at Figure 6 in this whitepaper http://www.vldb.org/pvldb/vol8/p1816-teller.pdf.
+	maxSamplesPerChunk = 120
 
-const maxChunkSize = 16000
+	maxChunkSize = 16000
+
+	// CompatibilityTypeLabelName
+	CompatibilityTypeLabelName = "@thanos_compatibility_store_type"
+)
 
 type bucketStoreMetrics struct {
 	blocksLoaded          prometheus.Gauge
@@ -554,7 +559,7 @@ func (s *BucketStore) Info(context.Context, *storepb.InfoRequest) (*storepb.Info
 	s.mtx.RLock()
 	res.LabelSets = make([]storepb.LabelSet, 0, len(s.labelSets))
 	for _, ls := range s.labelSets {
-		lset := []storepb.Label{}
+		lset := make([]storepb.Label, 0, len(ls))
 		for _, l := range ls {
 			lset = append(lset, storepb.Label{Name: l.Name, Value: l.Value})
 		}
@@ -562,6 +567,11 @@ func (s *BucketStore) Info(context.Context, *storepb.InfoRequest) (*storepb.Info
 	}
 	s.mtx.RUnlock()
 
+	if len(res.LabelSets) > 0 {
+		// This is for compatibility with Querier v0.7.0.
+		// See query.StoreCompatibilityTypeLabelName comment for details.
+		res.LabelSets = append(res.LabelSets, storepb.LabelSet{Labels: []storepb.Label{{Name: CompatibilityTypeLabelName, Value: "store"}}})
+	}
 	return res, nil
 }
 

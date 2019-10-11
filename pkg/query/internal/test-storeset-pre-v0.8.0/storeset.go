@@ -1,4 +1,8 @@
-package query
+/*
+This package is for compatibility testing purposes. It is a code from v0.7.0 Querier.
+*/
+
+package testoldstoreset
 
 import (
 	"context"
@@ -22,6 +26,7 @@ import (
 
 const (
 	unhealthyStoreMessage = "removing store because it's unhealthy or does not exist"
+	droppingStoreMessage  = "dropping store, external labels are not unique"
 )
 
 type StoreSpec interface {
@@ -89,19 +94,19 @@ type StoreSet struct {
 	storesStatusesMtx                sync.RWMutex
 	stores                           map[string]*storeRef
 	storeNodeConnections             prometheus.Gauge
-	externalLabelOccurrencesInStores map[component.StoreAPI]map[string]int
+	externalLabelOccurrencesInStores map[string]int
 	storeStatuses                    map[string]*StoreStatus
 	unhealthyStoreTimeout            time.Duration
 }
 
 type storeSetNodeCollector struct {
-	externalLabelOccurrences func() map[component.StoreAPI]map[string]int
+	externalLabelOccurrences func() map[string]int
 }
 
 var nodeInfoDesc = prometheus.NewDesc(
 	"thanos_store_node_info",
 	"Number of nodes with the same external labels identified by their hash. If any time-series is larger than 1, external label uniqueness is not true",
-	[]string{"external_labels", "store_type"}, nil,
+	[]string{"external_labels"}, nil,
 )
 
 func (c *storeSetNodeCollector) Describe(ch chan<- *prometheus.Desc) {
@@ -110,14 +115,8 @@ func (c *storeSetNodeCollector) Describe(ch chan<- *prometheus.Desc) {
 
 func (c *storeSetNodeCollector) Collect(ch chan<- prometheus.Metric) {
 	externalLabelOccurrences := c.externalLabelOccurrences()
-	for storeType, occurrencesPerExtLset := range externalLabelOccurrences {
-		for externalLabels, occurrences := range occurrencesPerExtLset {
-			var storeTypeStr string
-			if storeType != nil {
-				storeTypeStr = storeType.String()
-			}
-			ch <- prometheus.MustNewConstMetric(nodeInfoDesc, prometheus.GaugeValue, float64(occurrences), externalLabels, storeTypeStr)
-		}
+	for externalLabels, occurrences := range externalLabelOccurrences {
+		ch <- prometheus.MustNewConstMetric(nodeInfoDesc, prometheus.GaugeValue, float64(occurrences), externalLabels)
 	}
 }
 
@@ -150,7 +149,7 @@ func NewStoreSet(
 		dialOpts:                         dialOpts,
 		storeNodeConnections:             storeNodeConnections,
 		gRPCInfoCallTimeout:              10 * time.Second,
-		externalLabelOccurrencesInStores: map[component.StoreAPI]map[string]int{},
+		externalLabelOccurrencesInStores: map[string]int{},
 		stores:                           make(map[string]*storeRef),
 		storeStatuses:                    make(map[string]*StoreStatus),
 		unhealthyStoreTimeout:            unhealthyStoreTimeout,
@@ -221,14 +220,11 @@ func (s *StoreSet) Update(ctx context.Context) {
 	healthyStores := s.getHealthyStores(ctx)
 
 	// Record the number of occurrences of external label combinations for current store slice.
-	externalLabelOccurrencesInStores := map[component.StoreAPI]map[string]int{}
+	externalLabelOccurrencesInStores := map[string]int{}
 	for _, st := range healthyStores {
-		if externalLabelOccurrencesInStores[st.storeType] == nil {
-			externalLabelOccurrencesInStores[st.storeType] = map[string]int{}
-		}
-		externalLabelOccurrencesInStores[st.storeType][externalLabelsFromStore(st)]++
+		externalLabelOccurrencesInStores[externalLabelsFromStore(st)]++
 	}
-	level.Debug(s.logger).Log("msg", "updating healthy stores", "externalLabelOccurrencesInStores", fmt.Sprintf("%v", externalLabelOccurrencesInStores))
+	level.Debug(s.logger).Log("msg", "updating healthy stores", "externalLabelOccurrencesInStores", fmt.Sprintf("%#+v", externalLabelOccurrencesInStores))
 
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
@@ -253,7 +249,16 @@ func (s *StoreSet) Update(ctx context.Context) {
 			continue
 		}
 
-		// TODO(bwplotka): Bring back duplicate checks. See: https://github.com/thanos-io/thanos/issues/1635
+		externalLabels := externalLabelsFromStore(store)
+		if len(store.LabelSets()) > 0 &&
+			externalLabelOccurrencesInStores[externalLabels] != 1 {
+			store.close()
+			s.updateStoreStatus(store, errors.New(droppingStoreMessage))
+			level.Warn(s.logger).Log("msg", droppingStoreMessage, "address", addr, "extLset", externalLabels, "duplicates", externalLabelOccurrencesInStores[externalLabels])
+			// We don't want to block all of them. Leave one to not disrupt in terms of migration.
+			externalLabelOccurrencesInStores[externalLabels]--
+			continue
+		}
 
 		s.stores[addr] = store
 		s.updateStoreStatus(store, nil)
@@ -339,17 +344,9 @@ func (s *StoreSet) getHealthyStores(ctx context.Context) map[string]*storeRef {
 	return healthyStores
 }
 
-func externalLabelsFromStore(st *storeRef) string {
-	tsdbLabelSetStrings := make([]string, 0, len(st.labelSets))
-	for _, ls := range st.labelSets {
-		if len(ls.Labels) == 0 {
-			continue
-		}
-		// See constant comment for the purpose.
-		if ls.Labels[0].Name == store.CompatibilityTypeLabelName {
-			continue
-		}
-
+func externalLabelsFromStore(store *storeRef) string {
+	tsdbLabelSetStrings := make([]string, 0, len(store.labelSets))
+	for _, ls := range store.labelSets {
 		tsdbLabels := labels.Labels(make([]labels.Label, 0, len(ls.Labels)))
 		for _, l := range ls.Labels {
 			tsdbLabels = append(tsdbLabels, labels.Label{
@@ -361,7 +358,6 @@ func externalLabelsFromStore(st *storeRef) string {
 		tsdbLabelSetStrings = append(tsdbLabelSetStrings, tsdbLabels.String())
 	}
 	sort.Strings(tsdbLabelSetStrings)
-
 	return strings.Join(tsdbLabelSetStrings, ",")
 }
 
@@ -403,16 +399,13 @@ func (s *StoreSet) GetStoreStatus() []StoreStatus {
 	return statuses
 }
 
-func (s *StoreSet) externalLabelOccurrences() map[component.StoreAPI]map[string]int {
+func (s *StoreSet) externalLabelOccurrences() map[string]int {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
 
-	r := make(map[component.StoreAPI]map[string]int, len(s.externalLabelOccurrencesInStores))
+	r := make(map[string]int, len(s.externalLabelOccurrencesInStores))
 	for k, v := range s.externalLabelOccurrencesInStores {
-		r[k] = make(map[string]int, len(v))
-		for kk, vv := range v {
-			r[k][kk] = vv
-		}
+		r[k] = v
 	}
 
 	return r
